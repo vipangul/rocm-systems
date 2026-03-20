@@ -105,4 +105,9 @@ get_tool_state();
 void
 write_json_output();
 
+/// Write all captured records to SQLite .db file (same schema as JSON)
+/// Available only when built with SQLite3.
+void
+write_db_output();
+
 }  // namespace aql_dump

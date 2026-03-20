@@ -12,7 +12,8 @@
 #   # or
 #   LD_PRELOAD=./libaql_dump_tool.so ./aql_test_app
 #
-# Output: aql_dump_output.json (or set AQL_DUMP_OUTPUT env var)
+# Output: aql_dump_output.json (default), or .db (SQLite) if path ends with .db.
+# Set AQL_DUMP_OUTPUT env var to override path; format is chosen by file extension.
 #
 
 cmake_minimum_required(VERSION 3.21.0 FATAL_ERROR)
@@ -24,6 +25,38 @@ project(aql-dump-tool LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ---------------------------------------------------------------------------
+# ROCm path (must be set before HIP language is enabled)
+# ---------------------------------------------------------------------------
+if(NOT DEFINED ROCM_PATH)
+    if(DEFINED ENV{ROCM_PATH})
+        set(ROCM_PATH "$ENV{ROCM_PATH}")
+    else()
+        set(ROCM_PATH "/opt/rocm")
+    endif()
+endif()
+
+# HIP is only needed for the test apps (aql_test_app, etc.). The main tool
+# (libaql_dump_tool.so) is C++ only. Only enable HIP if the HIP runtime
+# CMake package is present; otherwise skip test apps and build the tool only.
+set(_HIP_LANG_CONFIG "")
+if(EXISTS "${ROCM_PATH}/lib/cmake/hip-lang/hip-lang-config.cmake")
+    set(_HIP_LANG_CONFIG "${ROCM_PATH}/lib/cmake/hip-lang/hip-lang-config.cmake")
+elseif(EXISTS "${ROCM_PATH}/lib64/cmake/hip-lang/hip-lang-config.cmake")
+    set(_HIP_LANG_CONFIG "${ROCM_PATH}/lib64/cmake/hip-lang/hip-lang-config.cmake")
+endif()
+
+if(_HIP_LANG_CONFIG)
+    # CMake's HIP detection does not read ROCM_PATH; set CMAKE_HIP_COMPILER_ROCM_ROOT.
+    if(NOT DEFINED CMAKE_HIP_COMPILER_ROCM_ROOT)
+        set(CMAKE_HIP_COMPILER_ROCM_ROOT "${ROCM_PATH}" CACHE PATH "ROCm root for HIP")
+    endif()
+else()
+    # No HIP runtime package — do not enable HIP (tool library builds without it).
+    unset(CMAKE_HIP_COMPILER_ROCM_ROOT CACHE)
+endif()
+unset(_HIP_LANG_CONFIG)
 
 # ---------------------------------------------------------------------------
 # Optionally find HIP compiler for the test application
@@ -43,7 +76,7 @@ if(NOT CMAKE_HIP_COMPILER)
 endif()
 
 set(HIP_AVAILABLE OFF)
-if(CMAKE_HIP_COMPILER)
+if(CMAKE_HIP_COMPILER AND CMAKE_HIP_COMPILER_ROCM_ROOT)
     enable_language(HIP)
     set(HIP_AVAILABLE ON)
 
@@ -52,17 +85,8 @@ if(CMAKE_HIP_COMPILER)
             set(CMAKE_HIP_FLAGS_${_TYPE} "${CMAKE_CXX_FLAGS_${_TYPE}}")
         endif()
     endforeach()
-endif()
-
-# ---------------------------------------------------------------------------
-# ROCm paths
-# ---------------------------------------------------------------------------
-if(NOT DEFINED ROCM_PATH)
-    if(DEFINED ENV{ROCM_PATH})
-        set(ROCM_PATH "$ENV{ROCM_PATH}")
-    else()
-        set(ROCM_PATH "/opt/rocm")
-    endif()
+elseif(CMAKE_HIP_COMPILER)
+    message(STATUS "HIP runtime CMake package missing in ${ROCM_PATH} — test apps (aql_test_app, etc.) will NOT be built; libaql_dump_tool.so will be built.")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -183,6 +207,17 @@ find_library(HSA_RUNTIME_LIB
     PATHS ${ROCM_PATH}/lib)
 
 # ---------------------------------------------------------------------------
+# Optional SQLite3 for .db output format
+# ---------------------------------------------------------------------------
+find_package(SQLite3 QUIET)
+if(SQLite3_FOUND)
+    message(STATUS "SQLite3 found — .db output format enabled")
+    set(AQL_DUMP_TOOL_HAS_SQLITE 1)
+else()
+    message(STATUS "SQLite3 not found — only JSON output will be available")
+endif()
+
+# ---------------------------------------------------------------------------
 # Tool shared library: libaql_dump_tool.so
 # ---------------------------------------------------------------------------
 add_library(aql_dump_tool SHARED
@@ -194,6 +229,11 @@ target_include_directories(aql_dump_tool PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${HSA_INCLUDE_DIRS}
 )
+
+if(SQLite3_FOUND)
+    target_compile_definitions(aql_dump_tool PRIVATE AQL_DUMP_TOOL_HAS_SQLITE=1)
+    target_link_libraries(aql_dump_tool PRIVATE SQLite::SQLite3)
+endif()
 
 # hsa_api_trace.h uses AMD_INTERNAL_BUILD to select between flat includes
 # (e.g. "hsa_ext_image.h") and prefixed includes (e.g. "inc/hsa_ext_image.h").

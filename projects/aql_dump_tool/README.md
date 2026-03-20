@@ -49,6 +49,7 @@ Load the tool via the `ROCP_TOOL_LIBRARIES` environment variable:
 ```bash
 # Set library paths (adjust ROCM_PATH as needed)
 export ROCM_PATH=/opt/rocm
+
 export LD_LIBRARY_PATH=${ROCM_PATH}/lib:$LD_LIBRARY_PATH
 
 # Run with the tool loaded
@@ -60,6 +61,14 @@ By default, the output is written to `aql_dump_output.json` in the current direc
 ```bash
 AQL_DUMP_OUTPUT=/path/to/output.json ROCP_TOOL_LIBRARIES=./libaql_dump_tool.so ./aql_test_app
 ```
+
+To write **SQLite .db** output instead of JSON, set the output path to a file ending in `.db` (requires building with SQLite3):
+
+```bash
+AQL_DUMP_OUTPUT=/path/to/output.db ROCP_TOOL_LIBRARIES=./libaql_dump_tool.so ./aql_test_app
+```
+
+Format is determined by the file extension: `.db` → SQLite database, anything else → JSON.
 
 ### 3. Validate
 
@@ -275,6 +284,8 @@ aql_dump_tool/
 | `ROCR_LIBHSAKMT_INCLUDE_DIR` | `../projects/rocr-runtime/libhsakmt/include` | Path to libhsakmt headers (needed by SDK headers) |
 | `CMAKE_HIP_COMPILER` | auto-detected | Path to `amdclang++` (needed for test apps only) |
 
+SQLite3 is detected via `find_package(SQLite3)`. If found, the tool is built with support for `.db` output; otherwise only JSON output is available.
+
 ### Building Against Installed ROCm
 
 ```bash
@@ -295,8 +306,13 @@ The build system automatically generates a `version.h` from the SDK's template w
 | Variable | Description |
 |---|---|
 | `ROCP_TOOL_LIBRARIES` | Set to path of `libaql_dump_tool.so` to load the tool |
-| `AQL_DUMP_OUTPUT` | Override output file path (default: `aql_dump_output.json`) |
+| `AQL_DUMP_OUTPUT` | Override output file path (default: `aql_dump_output.json`). Use a path ending in `.db` for SQLite output. |
 | `LD_LIBRARY_PATH` | Must include `${ROCM_PATH}/lib` for HSA and HIP runtime libraries |
+
+### Output formats
+
+- **JSON** — Default. Set `AQL_DUMP_OUTPUT` to any path not ending in `.db` (e.g. `output.json`).
+- **SQLite (.db)** — Set `AQL_DUMP_OUTPUT` to a path ending in `.db` (e.g. `output.db`). The tool must be built with SQLite3 (`find_package(SQLite3)`). The database contains a single table `aql_packets` with columns: `seq_num`, `packet_type`, `packet_type_name`, `queue_id`, `raw_dwords` (text), `gpu_timestamp_ns`, `kernel_object_addr`, `kernel_descriptor_dwords` (text).
 
 ## Troubleshooting
 

@@ -41,6 +41,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(AQL_DUMP_TOOL_HAS_SQLITE) && AQL_DUMP_TOOL_HAS_SQLITE
+#include <sqlite3.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Macro helpers (two-level indirection needed for __LINE__ expansion with ##)
 // ---------------------------------------------------------------------------
@@ -359,12 +363,6 @@ write_json_output()
 {
     auto& state = get_tool_state();
 
-    // Check for env var override
-    if(const char* env = std::getenv("AQL_DUMP_OUTPUT"))
-    {
-        state.output_path = env;
-    }
-
     std::ofstream ofs(state.output_path);
     if(!ofs.is_open())
     {
@@ -431,6 +429,130 @@ write_json_output()
 }
 
 // ---------------------------------------------------------------------------
+// SQLite .db output (optional, when built with SQLite3)
+// ---------------------------------------------------------------------------
+#if defined(AQL_DUMP_TOOL_HAS_SQLITE) && AQL_DUMP_TOOL_HAS_SQLITE
+void
+write_db_output()
+{
+    auto& state = get_tool_state();
+    // output_path is set from AQL_DUMP_OUTPUT in tool_fini before we are called
+
+    sqlite3* db = nullptr;
+    int rc = sqlite3_open_v2(state.output_path.c_str(),
+                            &db,
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                            nullptr);
+    if(rc != SQLITE_OK || db == nullptr)
+    {
+        fprintf(stderr, "[aql_dump_tool] ERROR: Cannot open SQLite DB: %s (%s)\n",
+                state.output_path.c_str(),
+                db ? sqlite3_errmsg(db) : "open failed");
+        if(db) sqlite3_close(db);
+        return;
+    }
+
+    const char* create_sql =
+        "CREATE TABLE IF NOT EXISTS aql_packets (\n"
+        "  seq_num INTEGER NOT NULL,\n"
+        "  packet_type INTEGER NOT NULL,\n"
+        "  packet_type_name TEXT NOT NULL,\n"
+        "  queue_id INTEGER NOT NULL,\n"
+        "  raw_dwords TEXT NOT NULL,\n"
+        "  gpu_timestamp_ns INTEGER,\n"
+        "  kernel_object_addr TEXT,\n"
+        "  kernel_descriptor_dwords TEXT\n"
+        ");";
+    char* errmsg = nullptr;
+    rc = sqlite3_exec(db, create_sql, nullptr, nullptr, &errmsg);
+    if(rc != SQLITE_OK)
+    {
+        fprintf(stderr, "[aql_dump_tool] ERROR: CREATE TABLE failed: %s\n", errmsg ? errmsg : "");
+        sqlite3_free(errmsg);
+        sqlite3_close(db);
+        return;
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    const char* insert_sql =
+        "INSERT INTO aql_packets(seq_num, packet_type, packet_type_name, queue_id, "
+        "raw_dwords, gpu_timestamp_ns, kernel_object_addr, kernel_descriptor_dwords) "
+        "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);";
+    rc = sqlite3_prepare_v2(db, insert_sql, -1, &stmt, nullptr);
+    if(rc != SQLITE_OK)
+    {
+        fprintf(stderr, "[aql_dump_tool] ERROR: INSERT prepare failed: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return;
+    }
+
+    for(const auto& rec : state.records)
+    {
+        // raw_dwords as comma-separated hex
+        std::ostringstream raw_ss;
+        for(int d = 0; d < 16; ++d)
+        {
+            if(d > 0) raw_ss << ",";
+            raw_ss << "0x" << std::hex << std::setw(8) << std::setfill('0') << rec.raw_dwords[d];
+        }
+        std::string raw_str = raw_ss.str();
+
+        std::string kernel_addr_str;
+        std::string kernel_desc_str;
+        if(rec.has_kernel_descriptor)
+        {
+            std::ostringstream addr_ss;
+            addr_ss << "0x" << std::hex << rec.kernel_object_addr;
+            kernel_addr_str = addr_ss.str();
+            std::ostringstream desc_ss;
+            for(int d = 0; d < 16; ++d)
+            {
+                if(d > 0) desc_ss << ",";
+                desc_ss << "0x" << std::hex << std::setw(8) << std::setfill('0')
+                        << rec.kernel_descriptor_dwords[d];
+            }
+            kernel_desc_str = desc_ss.str();
+        }
+
+        sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(rec.seq_num));
+        sqlite3_bind_int(stmt, 2, static_cast<int>(rec.packet_type));
+        sqlite3_bind_text(stmt, 3, packet_type_name(rec.packet_type), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(rec.queue_id));
+        sqlite3_bind_text(stmt, 5, raw_str.c_str(), -1, SQLITE_TRANSIENT);
+        if(rec.has_barrier_timestamp && rec.gpu_timestamp_ns > 0)
+            sqlite3_bind_int64(stmt, 6, static_cast<sqlite3_int64>(rec.gpu_timestamp_ns));
+        else
+            sqlite3_bind_null(stmt, 6);
+        if(rec.has_kernel_descriptor)
+        {
+            sqlite3_bind_text(stmt, 7, kernel_addr_str.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 8, kernel_desc_str.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        else
+        {
+            sqlite3_bind_null(stmt, 7);
+            sqlite3_bind_null(stmt, 8);
+        }
+
+        rc = sqlite3_step(stmt);
+        if(rc != SQLITE_DONE)
+        {
+            fprintf(stderr, "[aql_dump_tool] ERROR: INSERT failed: %s\n", sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+            return;
+        }
+        sqlite3_reset(stmt);
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    fprintf(stderr, "[aql_dump_tool] Wrote %zu packet records to %s (SQLite)\n",
+            state.records.size(), state.output_path.c_str());
+}
+#endif  // AQL_DUMP_TOOL_HAS_SQLITE
+
+// ---------------------------------------------------------------------------
 // HSA API table interception callback
 // ---------------------------------------------------------------------------
 static void
@@ -477,6 +599,14 @@ tool_init(rocprofiler_client_finalize_t fini_func, void* tool_data)
     return 0;  // success
 }
 
+static bool
+path_ends_with(const std::string& path, const char* suffix)
+{
+    size_t plen = path.length();
+    size_t slen = std::strlen(suffix);
+    return plen >= slen && path.compare(plen - slen, slen, suffix) == 0;
+}
+
 static void
 tool_fini(void* tool_data)
 {
@@ -487,8 +617,30 @@ tool_fini(void* tool_data)
     // Collect GPU timestamps from barrier completion signals
     collect_barrier_timestamps();
 
-    // Write JSON output
-    write_json_output();
+    auto& state = get_tool_state();
+    if(const char* env = std::getenv("AQL_DUMP_OUTPUT"))
+    {
+        state.output_path = env;
+    }
+
+    if(path_ends_with(state.output_path, ".db"))
+    {
+#if defined(AQL_DUMP_TOOL_HAS_SQLITE) && AQL_DUMP_TOOL_HAS_SQLITE
+        write_db_output();
+#else
+        fprintf(stderr, "[aql_dump_tool] WARNING: .db output requested but SQLite3 not available; "
+                        "writing JSON instead. Set AQL_DUMP_OUTPUT to a .json path or build with SQLite3.\n");
+        if(state.output_path.size() >= 3)
+        {
+            state.output_path.replace(state.output_path.size() - 3, 3, "json");
+        }
+        write_json_output();
+#endif
+    }
+    else
+    {
+        write_json_output();
+    }
 }
 
 }  // namespace aql_dump
